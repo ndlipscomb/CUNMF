@@ -1,9 +1,10 @@
-function [ Wout, Hout, RelErr_out, total_iter, conv_ratio, Vperm,...
-    Idx_out] = CUNMF( V, k, varargin )
+function [ Wout, Hout, Vperm, Rel_Err, Idx_out] = CUNMF( V, k, varargin )
 % Produces a solution to the NMF problem V = WH by means of the
 % continuously updating nonnegative matrix factorisation approach
 % proposed by Lipscomb, Chang, Chen, & Wang. Rearrangement of the columns 
 % of V is considered acceptable.
+% This algorithm incorporates the 'nnmf' function from MATLAB. Please refer
+% to the documentation here: https://www.mathworks.com/help/stats/nnmf.html
 %INPUTS--------------------------------------------------------------------
 % V :               The matrix we seek to perform continuously updating 
 %                   nonnegative matrix factorisation on. We refer to 'm' as 
@@ -13,6 +14,9 @@ function [ Wout, Hout, RelErr_out, total_iter, conv_ratio, Vperm,...
 % k :               The rank of the factorisation.
 % The following name-value pairs can be used as additional arguments. See
 % below.
+% ALGORITHM :       Specify whether to use the alternating least squares
+%                   'als' algorithm or the multiplicative update 'mult'
+%                   algorithm. Default is 'mult'.
 % INIT_SIZE :       The size of the initial submatrix of V we perform NMF
 %                   and then add to via the continuous update rule. Must be
 %                   a positive integer smaller than 'n'. Default is
@@ -27,10 +31,10 @@ function [ Wout, Hout, RelErr_out, total_iter, conv_ratio, Vperm,...
 % UPDATE_ITER :     The maximum number of NMF iterations used for the
 %                   factorisation for each update after the initialisation. 
 %                   Default = 10 per column.
-% TOL :             The tolerance in terms of relative error |V-WH|/|V|
-%                   that must be met in order to terminate an NMF. Must be
-%                   a positive number, and should be close to 0. Default is
-%                   0.001
+% RES_TOL :         NMF termination tolerance on change in size of the 
+%                   residual. Default is 0.0001.
+% REL_TOL :         NMF termination tolerance on relative change in the 
+%                   elements of W and H. Default is 0.0001.
 % NUM_TESTS :       The number of random test initialisations that are
 %                   factorised in order to produce a good starting point
 %                   for the overall problem. Must be a positive integer.
@@ -49,32 +53,28 @@ function [ Wout, Hout, RelErr_out, total_iter, conv_ratio, Vperm,...
 %OUTPUTS-------------------------------------------------------------------
 % Wout :            The factor 'W' (basis matrix) resulting from CUNMF.
 % Hout :            The factor 'H' (weight matrix) resulting from CUNMF.
-% RelErr_out :      The relative error |V-WH|/|V| resulting from the CUNMF.
-% total_iter :      The total number of multiplicative update rules used to
-%                   produce the factorisation.
-% conv_ratio :      The percentage of NMFs that converged to the desired
-%                   tolerance. Calculated as 
-%                   (# of convergences)/(# of NMFs).
 % Vperm :           The column permutated matrix V reconstructed from the
 %                   continuous updating approach.
+% Rel_Err :         The relative error expressed as 
+%                   |Vperm-Wout*Hout|/|Vperm| with respect to the Frobenius
+%                   norm resulting from the CUNMF.
 % Idx_out :     The ordered list of indices from the original matrix,
 %                   V, corresponding to the column permutated matrix Vperm.
 
 %Set up constants and counters.
     [m,n] = size(V);
     V_red = V;
-    nmf_count = 1;
-    iter_count = 0;
-    converge_count = 0;
     Idx_orig = linspace(1,n,n);
     Idx_new = [];
     
 % Default configuration (not including matrix initialisations).
+    par.algorithm = 'mult';
     par.batch_size_I = round(n/10,0)+1;
     par.batch_size_C = 1;
     par.init_iter = 10*par.batch_size_I;
     par.update_iter = 10*par.batch_size_C;
-    par.TOL = 0.001;
+    par.res_TOL = 0.0001;
+    par.rel_TOL = 0.0001;
     par.num_tests = 10;
     W = rand(m,k);
     H = rand(k,par.batch_size_I);
@@ -87,11 +87,13 @@ function [ Wout, Hout, RelErr_out, total_iter, conv_ratio, Vperm,...
     else
         for i=1:2:(length(varargin)-1)
             switch upper(varargin{i})
+                case 'ALGORITHM',           par.algorithm = varargin{i+1};
                 case 'INIT_SIZE',           par.batch_size_I = varargin{i+1}; H = rand(k,par.batch_size_I); par.init_iter = 10*par.batch_size_I;
                 case 'UPDATE_SIZE',         par.batch_size_C = varargin{i+1}; par.update_iter = 10*par.batch_size_C;
                 case 'INIT_ITER',           par.init_iter = varargin{i+1};
                 case 'UPDATE_ITER',         par.update_iter = varargin{i+1};
-                case 'TOL',                 par.TOL = varargin{i+1};
+                case 'RES_TOL',             par.res_TOL = varargin{i+1};
+                case 'REL_TOL',             par.rel_TOL = varargin{i+1};
                 case 'NUM_TESTS',           par.num_tests = varargin{i+1};
                 case 'W_INIT',              W = varargin{i+1};
                 case 'H_INIT',              H = varargin{i+1};
@@ -101,32 +103,36 @@ function [ Wout, Hout, RelErr_out, total_iter, conv_ratio, Vperm,...
             end
         end
     end
-    
+%Set statset list for initialisation.
+opt = statset('MaxIter',par.init_iter,'TolFun',par.res_TOL,'TolX',...
+    par.rel_TOL);
 %Set the seed.
 rng(par.seed);
     
 %Create 'num_tests' initialisations. Test which factorisation produces
 %the least relative error, then use that as your starting point for the
 %continuous updating.
-   RelErr_test = 10^9;
+   Err_test = 10^9;
    for i=1:par.num_tests,
        [SubMat, SubMat_Idx, V_red, V_red_Idx] = RandomSubMat(V,...
            par.batch_size_I, Idx_orig);
-       [W_ini,H_ini,iter_ini,RelErr,Converge_ini] = BasicNMF(SubMat,...
-           W,H,par.TOL,par.init_iter);
-       if RelErr <= RelErr_test,
-           W = W_ini; H = H_ini; iter_count = iter_count+iter_ini; 
-           Conv = Converge_ini;
+       [W_ini,H_ini,Err] = nnmf(SubMat,k,'w0',W,'h0',H,'algorithm',...
+           par.algorithm,'options',opt);
+       if Err <= Err_test,
+           W = W_ini; H = H_ini;
            GrowMat = SubMat; V_rem = V_red;
            Idx_red = V_red_Idx; Idx_new = SubMat_Idx;
-           RelErr_test = RelErr;
+           Err_test = Err;
        end
    end
-   converge_count = converge_count + Conv;
 %We now have the initialisation matrix 'GrowMat', the reduced matrix
 %'V_rem' containing the remaining columns of 'V', and a starting NMF
 %with 'W' and 'H'.
-   
+
+%Set statset list for update iterations.
+opt = statset('MaxIter',par.update_iter,'TolFun',par.res_TOL,'TolX',...
+    par.rel_TOL);
+
 %Begin the continuously updating aspect of the algorithm. We will add
 %new randomly selected columns to 'GrowMat' and add their projections to
 %'H'.
@@ -142,37 +148,32 @@ rng(par.seed);
            end
        end
        H = [H Batch_Proj];
-       [W,H,iter,RelErr,converge] = BasicNMF(GrowMat,W,H,par.TOL,...
-           par.update_iter);
-       nmf_count = nmf_count+1;
-       converge_count = converge_count+converge;
-       iter_count = iter_count+iter;
+       [W,H,Err] = nnmf(GrowMat,k,'w0',W,'h0',H,'algorithm',...
+           par.algorithm,'options',opt);
    end
 %For any remaining columns less than the batch size, perform one last
 %projection and NMF iteration.
    if size(V_rem) > 0,
-       GrowMat = [GrowMat V_rem];
-       for i=1:size(V_rem,2),
+       [Final_Batch, SubMat_Idx, V_rem, V_rem_Idx] = RandomSubMat(V_rem,...
+           size(V_rem,2), Idx_red);
+       GrowMat = [GrowMat Final_Batch];
+       Idx_new = [Idx_new SubMat_Idx];
+       for i=1:size(Final_Batch,2),
            for j=1:k,
-               Rem_Proj(j,i) = (transpose(V_rem(:,i))*W(:,j))/...
+               Rem_Proj(j,i) = (transpose(Final_Batch(:,i))*W(:,j))/...
                    (transpose(W(:,j))*W(:,j));
            end
        end
        H = [H Rem_Proj];
-       [W,H,iter,RelErr,converge] = BasicNMF(GrowMat,W,H,par.TOL,...
-           par.update_iter);
-       nmf_count = nmf_count+1;
-       converge_count = converge_count+converge;
-       iter_count = iter_count+iter;
+       [W,H,Err] = nnmf(GrowMat,k,'w0',W,'h0',H,'algorithm',...
+           par.algorithm,'options',opt);
    end
 
 %Output the final results.
    Wout = W;
    Hout = H; 
-   RelErr_out = RelErr;
-   total_iter = iter_count; 
-   conv_ratio = converge_count/nmf_count;
    Vperm = GrowMat;
+   Rel_Err = norm(Vperm-Wout*Hout,'fro')/norm(Vperm,'fro');
    Idx_out = Idx_new;
 end
 
